@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Мониторинг БПЛА — Киев</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  #map { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+
+  #panel {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 1000;
+    background: rgba(0,0,0,0.85);
+    color: #fff;
+    padding: 12px 14px calc(12px + env(safe-area-inset-bottom, 0));
+    padding-top: calc(12px + env(safe-area-inset-top, 0));
+    font-size: 14px; line-height: 1.45;
+    max-height: 45vh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    border-bottom-left-radius: 14px;
+    border-bottom-right-radius: 14px;
+  }
+  #panel.collapsed { max-height: 58px; overflow: hidden; }
+  #panel .header {
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 10px;
+  }
+  #panel .title { font-weight: 700; color: #ffcc00; font-size: 14px; }
+  #panel .toggle {
+    background: rgba(255,255,255,0.15); color: #fff; border: none;
+    border-radius: 8px; padding: 5px 10px; font-size: 12px;
+    cursor: pointer; flex-shrink: 0;
+  }
+  #droneList { margin-top: 8px; }
+  .drone-row {
+    display: flex; align-items: flex-start; gap: 8px;
+    margin-top: 6px; font-size: 13px;
+  }
+  .dot {
+    width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0;
+    margin-top: 3px;
+  }
+  .drone-text { flex: 1; word-wrap: break-word; }
+  .drone-id { font-weight: 600; }
+  .drone-route { color: #ddd; font-size: 12px; }
+
+  .drone-icon { font-size: 26px; }
+  .leaflet-popup-content-wrapper { border-radius: 12px; }
+  .history-popup { font-size: 12px; max-height: 220px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .history-popup .entry { border-bottom: 1px solid #eee; padding: 7px 0; }
+  .history-popup .entry:last-child { border-bottom: none; }
+  .history-popup .time { color: #888; font-size: 11px; }
+  .history-popup .route { color: #222; font-weight: 600; margin-top: 2px; }
+  .history-popup .src { color: #777; font-size: 11px; margin-top: 3px; font-style: italic; }
+  .history-popup .empty { color: #999; font-style: italic; }
+
+  #status {
+    position: absolute; bottom: calc(14px + env(safe-area-inset-bottom, 0));
+    left: 14px; right: 14px; z-index: 1000;
+    background: rgba(0,0,0,0.75); color: #fff;
+    padding: 8px 12px; border-radius: 10px; font-size: 12px;
+    text-align: center;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  #status.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<div id="panel" class="collapsed">
+  <div class="header">
+    <div class="title" id="panelTitle">📡 Загрузка...</div>
+    <button class="toggle" id="toggleBtn">Развернуть</button>
+  </div>
+  <div id="droneList"></div>
+</div>
+
+<div id="map"></div>
+<div id="status"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.marker-motion@0.8.2/dist/leaflet.marker-motion.js"></script>
+<script>
+'use strict';
+
+// ============ КОНФИГ ============
+const CHANNELS = ['kyiv_monitor1'];
+const MESSAGES_TO_SCAN = 5;
+const POLL_INTERVAL_MS = 30_000;
+const RESET_AFTER_MS = 5 * 60 * 1000;
+const NOMINATIM_MIN_INTERVAL = 1100;
+const HISTORY_LIMIT = 20;
+
+// CORS-прокси. Если allorigins тормозит — поменяй на один из:
+//   'https://corsproxy.io/?url='
+//   'https://api.codetabs.com/v1/proxy?quest='
+const CORS_PROXY = 'https://api.allorigins.win/raw?url=';
+
+// ============ СЛОВАРЬ МЕСТ (Киев) ============
+const KYIV_LOCATIONS = {
+    'почайна':            { lat: 50.4722, lng: 30.5042, label: 'Почайна' },
+    'почайну':            { lat: 50.4722, lng: 30.5042, label: 'Почайна' },
+    'оболонь':            { lat: 50.5150, lng: 30.4980, label: 'Оболонь' },
+    'лукʼянівка':         { lat: 50.4592, lng: 30.4853, label: 'Лукьяновка' },
+    'лукьяновка':         { lat: 50.4592, lng: 30.4853, label: 'Лукьяновка' },
+    'лукʼянівку':         { lat: 50.4592, lng: 30.4853, label: 'Лукьяновка' },
+    'лукьяновку':         { lat: 50.4592, lng: 30.4853, label: 'Лукьяновка' },
+    'центр':              { lat: 50.4501, lng: 30.5234, label: 'Центр' },
+    'вокзал':             { lat: 50.4405, lng: 30.4908, label: 'Вокзал' },
+    'лівобережний':       { lat: 50.4522, lng: 30.6032, label: 'Левобережный' },
+    'лівобережний масив': { lat: 50.4522, lng: 30.6032, label: 'Левобережный массив' },
+    'русанівка':          { lat: 50.4432, lng: 30.5876, label: 'Русановка' },
+    'русанівку':          { lat: 50.4432, lng: 30.5876, label: 'Русановка' },
+    'березняки':          { lat: 50.4317, lng: 30.6032, label: 'Березняки' },
+    'тец-5':              { lat: 50.3926, lng: 30.5424, label: 'ТЭЦ-5' },
+    'тец5':               { lat: 50.3926, lng: 30.5424, label: 'ТЭЦ-5' },
+    'позняки':            { lat: 50.4081, lng: 30.6219, label: 'Позняки' },
+    'дарниця':            { lat: 50.4405, lng: 30.6322, label: 'Дарница' },
+    'дарницю':            { lat: 50.4405, lng: 30.6322, label: 'Дарница' },
+    'подол':              { lat: 50.4652, lng: 30.5190, label: 'Подол' },
+    'видубичі':           { lat: 50.3960, lng: 30.5580, label: 'Выдубичи' },
+    'сирець':             { lat: 50.4756, lng: 30.4478, label: 'Сырец' },
+    'нивки':              { lat: 50.4592, lng: 30.4217, label: 'Нивки' },
+    'святошин':           { lat: 50.4577, lng: 30.3732, label: 'Святошин' },
+    'теремки':            { lat: 50.3674, lng: 30.4740, label: 'Теремки' },
+    'голосіїв':           { lat: 50.3900, lng: 30.5000, label: 'Голосеево' },
+    'печерськ':           { lat: 50.4270, lng: 30.5400, label: 'Печерск' },
+    'троєщина':           { lat: 50.5150, lng: 30.5900, label: 'Троещина' },
+    'троещина':           { lat: 50.5150, lng: 30.5900, label: 'Троещина' },
+    'мост':               { lat: 50.4500, lng: 30.5300, label: 'Мост' },
+    'мості':              { lat: 50.4500, lng: 30.5300, label: 'Мост' },
+};
+
+// ============ УТИЛИТЫ ============
+function escapeRegex(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+}
+
+function formatTime(iso) {
+    try {
+        const d = new Date(iso);
+        const dd = String(d.getDate()).padStart(2, '0');
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const hh = String(d.getHours()).padStart(2, '0');
+        const mi = String(d.getMinutes()).padStart(2, '0');
+        return `${dd}.${mm} ${hh}:${mi}`;
+    } catch (e) { return iso; }
+}
+
+function showStatus(text, ms = 2500) {
+    const el = document.getElementById('status');
+    el.textContent = text;
+    el.classList.add('show');
+    clearTimeout(showStatus._t);
+    showStatus._t = setTimeout(() => el.classList.remove('show'), ms);
+}
+
+// ============ ПАРСЕР СООБЩЕНИЙ ============
+function extractDroneId(text) {
+    if (!text) return null;
+    const m = text.match(/\b(герань|шахед|shahed|geran|гербера)[\s\-–—]*(\d{1,4})\b/i);
+    if (m) {
+        const name = m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
+        return `${name}-${m[2]}`;
+    }
+    const t = text.match(/\b(герань|шахед|shahed|geran|гербера)\b/i);
+    if (t) {
+        const name = t[1].charAt(0).toUpperCase() + t[1].slice(1).toLowerCase();
+        return `${name}-?`;
+    }
+    return null;
+}
+
+function extractKnownPlaces(text) {
+    const lower = text.toLowerCase();
+    const found = [];
+    const seen = new Set();
+    for (const [key, coords] of Object.entries(KYIV_LOCATIONS)) {
+        const re = new RegExp(`(^|[\\s/,.|(])${escapeRegex(key)}([\\s/,.|)]|$)`, 'i');
+        if (re.test(lower) && !seen.has(coords.label)) {
+            seen.add(coords.label);
+            found.push({ ...coords, index: lower.indexOf(key) });
+        }
+    }
+    found.sort((a, b) => a.index - b.index);
+    return found;
+}
+
+function extractUnknownCandidates(text, knownPlaces) {
+    const knownLabels = new Set(knownPlaces.map(p => p.label.toLowerCase()));
+    const candidates = [];
+    const words = text.match(/\b[А-ЯІЇЄҐA-Z][а-яіїєґa-z]{4,}\b/g) || [];
+    for (const w of words) {
+        if (!knownLabels.has(w.toLowerCase()) && !candidates.includes(w)) {
+            candidates.push(w);
+        }
+    }
+    return candidates.slice(0, 3);
+}
+
+function parseMessage(text) {
+    if (!text) return null;
+    const lower = text.toLowerCase();
+    const droneWords = ['герань', 'бпла', 'дрон', 'ракет', 'шахед', 'shahed', 'geran', 'гербера'];
+    if (!droneWords.some(w => lower.includes(w))) return null;
+
+    const droneId = extractDroneId(text) || 'БПЛА-?';
+    const knownPlaces = extractKnownPlaces(text);
+    const needsGeocode = extractUnknownCandidates(text, knownPlaces);
+    return { droneId, route: knownPlaces, needsGeocode, sourceText: text };
+}
+
+// ============ ЗАГРУЗКА HTML С t.me ЧЕРЕЗ CORS-ПРОКСИ ============
+async function fetchChannelHtml(channel) {
+    const target = `https://t.me/s/${channel}`;
+    const url = CORS_PROXY + encodeURIComponent(target);
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.text();
+}
+
+function parseChannelMessages(html) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    const posts = doc.querySelectorAll('.tgme_widget_message_wrap');
+    const messages = [];
+    posts.forEach((post, i) => {
+        // Берём последние MESSAGES_TO_SCAN
+        if (i < posts.length - MESSAGES_TO_SCAN) return;
+        const textEl = post.querySelector('.tgme_widget_message_text');
+        const timeEl = post.querySelector('.tgme_widget_message_date time');
+        const text = textEl ? textEl.innerText.trim() : '';
+        const time = timeEl ? timeEl.getAttribute('datetime') : null;
+        if (text) messages.push({ text, time });
+    });
+    return messages;
+}
+
+// ============ ГЕОКОДИНГ ============
+let geocodeCache = {};
+let lastNominatimCall = 0;
+
+function loadCache() {
+    try {
+        const raw = localStorage.getItem('geocode_cache');
+        if (raw) geocodeCache = JSON.parse(raw);
+    } catch (e) { console.warn('cache load', e); }
+}
+function saveCache() {
+    try { localStorage.setItem('geocode_cache', JSON.stringify(geocodeCache)); }
+    catch (e) { console.warn('cache save', e); }
+}
+
+async function geocodePlace(placeName) {
+    const key = placeName.toLowerCase();
+    if (geocodeCache[key] !== undefined) return geocodeCache[key];
+
+    const now = Date.now();
+    const wait = NOMINATIM_MIN_INTERVAL - (now - lastNominatimCall);
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    lastNominatimCall = Date.now();
+
+    try {
+        const url = 'https://nominatim.openstreetmap.org/search?' +
+            new URLSearchParams({
+                q: `${placeName}, Київ, Україна`,
+                format: 'json',
+                limit: '1',
+            });
+        const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+        const data = await r.json();
+        if (data && data.length > 0) {
+            const result = {
+                lat: parseFloat(data[0].lat),
+                lng: parseFloat(data[0].lon),
+                label: placeName,
+            };
+            geocodeCache[key] = result;
+            saveCache();
+            console.log('🌍 Nominatim:', placeName, '→', result.lat, result.lng);
+            return result;
+        }
+    } catch (e) {
+        console.warn('Nominatim error:', e);
+    }
+    geocodeCache[key] = null;
+    saveCache();
+    return null;
+}
+
+// ============ СОСТОЯНИЕ (в localStorage) ============
+let state = { drones: {} };
+let history = {};
+
+function loadState() {
+    try {
+        const raw = localStorage.getItem('drone_state');
+        if (raw) state = JSON.parse(raw);
+        if (!state.drones) state = { drones: {} };
+    } catch (e) { state = { drones: {} }; }
+}
+function saveState() {
+    try { localStorage.setItem('drone_state', JSON.stringify(state)); }
+    catch (e) { console.warn('state save', e); }
+}
+
+function loadHistory() {
+    try {
+        const raw = localStorage.getItem('drone_history');
+        if (raw) history = JSON.parse(raw);
+    } catch (e) { history = {}; }
+}
+function saveHistory() {
+    try { localStorage.setItem('drone_history', JSON.stringify(history)); }
+    catch (e) { console.warn('history save', e); }
+}
+
+function appendHistory(droneId, entry) {
+    if (!history[droneId]) history[droneId] = [];
+    const last = history[droneId][history[droneId].length - 1];
+    if (last && last.timestamp === entry.timestamp) return;
+    history[droneId].push(entry);
+    if (history[droneId].length > HISTORY_LIMIT) {
+        history[droneId] = history[droneId].slice(-HISTORY_LIMIT);
+    }
+    saveHistory();
+}
+
+function pruneOldDrones() {
+    const now = Date.now();
+    let changed = false;
+    for (const [id, d] of Object.entries(state.drones)) {
+        const age = now - new Date(d.timestamp).getTime();
+        if (age > RESET_AFTER_MS) {
+            delete state.drones[id];
+            changed = true;
+        }
+    }
+    if (changed) saveState();
+}
+
+// ============ ОСНОВНОЙ ЦИКЛ ОПРОСА ============
+let isPolling = false;
+
+async function pollAllChannels() {
+    if (isPolling) return;
+    isPolling = true;
+
+    try {
+        for (const channel of CHANNELS) {
+            let messages;
+            try {
+                const html = await fetchChannelHtml(channel);
+                messages = parseChannelMessages(html);
+            } catch (e) {
+                console.error('Ошибка загрузки ' + channel + ':', e);
+                showStatus('⚠️ Не удалось загрузить канал');
+                continue;
+            }
+
+            // Идём от самых свежих
+            for (let i = messages.length - 1; i >= 0; i--) {
+                const msg = messages[i];
+                const parsed = parseMessage(msg.text);
+                if (!parsed) continue;
+
+                let route = parsed.route;
+
+                if (parsed.needsGeocode.length > 0) {
+                    for (const cand of parsed.needsGeocode) {
+                        const geo = await geocodePlace(cand);
+                        if (geo) route.push(geo);
+                    }
+                }
+                if (route.length === 0) continue;
+
+                const id = parsed.droneId;
+                const timestamp = msg.time || new Date().toISOString();
+
+                const existing = state.drones[id];
+                if (existing && existing.timestamp === timestamp) continue;
+
+                state.drones[id] = {
+                    id, route, timestamp,
+                    sourceText: parsed.sourceText,
+                    channel,
+                };
+                appendHistory(id, {
+                    timestamp,
+                    route,
+                    sourceText: parsed.sourceText,
+                    channel,
+                });
+                saveState();
+                console.log(`[${channel}] ${id}: ${route.map(p => p.label).join(' → ')}`);
+            }
+        }
+
+        pruneOldDrones();
+        renderAll();
+    } catch (e) {
+        console.error('pollAllChannels:', e);
+    } finally {
+        isPolling = false;
+    }
+}
+
+// ============ КАРТА ============
+const map = L.map('map', {
+    zoomControl: false,
+    attributionControl: false,
+}).setView([50.4501, 30.5234], 12);
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+}).addTo(map);
+
+L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+const COLORS = ['#ff3b30','#ff9500','#ffcc00','#34c759','#00c7be','#30b0c7','#007aff','#5856d6','#af52de','#ff2d55'];
+const colorMap = {};
+function colorFor(id) {
+    if (!colorMap[id]) colorMap[id] = COLORS[Object.keys(colorMap).length % COLORS.length];
+    return colorMap[id];
+}
+
+const activeDrones = {};
+
+function makeIcon(id) {
+    const color = colorFor(id);
+    return L.divIcon({
+        className: 'drone-icon',
+        html:
+            '<div style="font-size:26px;filter:drop-shadow(0 0 6px ' + color + ')">✈️</div>' +
+            '<div style="font-size:10px;color:' + color + ';font-weight:700;text-align:center;white-space:nowrap">' +
+                escapeHtml(id) +
+            '</div>',
+        iconSize: [44, 44],
+        iconAnchor: [22, 22]
+    });
+}
+
+function openHistoryPopup(id, latlng) {
+    const items = (history[id] || []).slice().reverse();
+    let html = '<div class="history-popup">';
+    html += '<div style="font-weight:700;margin-bottom:6px">📜 ' + escapeHtml(id) + '</div>';
+    if (items.length === 0) {
+        html += '<div class="empty">История пуста</div>';
+    } else {
+        for (const h of items) {
+            const route = (h.route || []).map(p => escapeHtml(p.label)).join(' → ');
+            let src = '';
+            if (h.sourceText) {
+                const t = h.sourceText.length > 120 ? h.sourceText.slice(0, 120) + '…' : h.sourceText;
+                src = escapeHtml(t);
+            }
+            html += '<div class="entry">';
+            html += '<div class="time">' + formatTime(h.timestamp) + '</div>';
+            html += '<div class="route">' + route + '</div>';
+            if (src) html += '<div class="src">«' + src + '»</div>';
+            html += '</div>';
+        }
+    }
+    html += '</div>';
+
+    L.popup({ maxWidth: 320, minWidth: 260, autoPan: true })
+        .setLatLng(latlng)
+        .setContent(html)
+        .openOn(map);
+}
+
+function renderDrone(drone) {
+    const existing = activeDrones[drone.id];
+    if (existing && existing.lastTimestamp === drone.timestamp) return;
+
+    if (existing) {
+        if (existing.marker) map.removeLayer(existing.marker);
+        if (existing.polyline) map.removeLayer(existing.polyline);
+    }
+
+    const points = drone.route;
+    if (!points || points.length === 0) return;
+
+    const color = colorFor(drone.id);
+    const icon = makeIcon(drone.id);
+
+    if (points.length === 1) {
+        const m = L.marker([points[0].lat, points[0].lng], { icon }).addTo(map);
+        m.on('click', () => openHistoryPopup(drone.id, m.getLatLng()));
+        activeDrones[drone.id] = { marker: m, polyline: null, lastTimestamp: drone.timestamp };
+        return;
+    }
+
+    const latlngs = points.map(p => [p.lat, p.lng]);
+    const polyline = L.polyline(latlngs, {
+        color, weight: 3, dashArray: '6,10', opacity: 0.85
+    }).addTo(map);
+
+    const marker = L.markerMotion(latlngs, 80, {
+        icon, rotation: true, autoplay: true, loop: false
+    }).addTo(map);
+
+    marker.on('click', () => openHistoryPopup(drone.id, marker.getLatLng()));
+
+    activeDrones[drone.id] = { marker, polyline, lastTimestamp: drone.timestamp };
+
+    if (Object.keys(activeDrones).length === 1) {
+        try { map.fitBounds(polyline.getBounds(), { padding: [60, 60] }); } catch (e) {}
+    }
+}
+
+function removeStaleDrones(currentIds) {
+    for (const id of Object.keys(activeDrones)) {
+        if (!currentIds.includes(id)) {
+            const d = activeDrones[id];
+            if (d.marker) map.removeLayer(d.marker);
+            if (d.polyline) map.removeLayer(d.polyline);
+            delete activeDrones[id];
+        }
+    }
+}
+
+function updatePanel(drones) {
+    const title = document.getElementById('panelTitle');
+    const list = document.getElementById('droneList');
+
+    if (drones.length === 0) {
+        title.textContent = '📡 Нет активных дронов';
+        list.innerHTML = '';
+        return;
+    }
+    title.textContent = '📡 Активные дроны: ' + drones.length;
+
+    let html = '';
+    for (const d of drones) {
+        const color = colorFor(d.id);
+        const routeStr = (d.route || []).map(p => escapeHtml(p.label)).join(' → ');
+        html +=
+            '<div class="drone-row">' +
+                '<span class="dot" style="background:' + color + '"></span>' +
+                '<div class="drone-text">' +
+                    '<div class="drone-id" style="color:' + color + '">' + escapeHtml(d.id) + '</div>' +
+                    '<div class="drone-route">' + routeStr + '</div>' +
+                '</div>' +
+            '</div>';
+    }
+    list.innerHTML = html;
+}
+
+function renderAll() {
+    const drones = Object.values(state.drones);
+    removeStaleDrones(drones.map(d => d.id));
+    for (const d of drones) renderDrone(d);
+    updatePanel(drones);
+}
+
+// ============ UI: сворачивание панели ============
+const panel = document.getElementById('panel');
+const toggleBtn = document.getElementById('toggleBtn');
+toggleBtn.addEventListener('click', () => {
+    panel.classList.toggle('collapsed');
+    toggleBtn.textContent = panel.classList.contains('collapsed') ? 'Развернуть' : 'Свернуть';
+});
+
+// ============ СТАРТ ============
+loadCache();
+loadState();
+loadHistory();
+renderAll();
+
+pollAllChannels();
+setInterval(pollAllChannels, POLL_INTERVAL_MS);
+setInterval(() => {
+    pruneOldDrones();
+    renderAll();
+}, 60_000);
+
+showStatus('Загрузка данных...');
+</script>
+</body>
+</html>
